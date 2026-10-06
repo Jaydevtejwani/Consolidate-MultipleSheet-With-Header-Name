@@ -3,33 +3,8 @@ from tkinter import ttk, filedialog, messagebox
 import pandas as pd
 import os
 import re
-import difflib
 from collections import OrderedDict
-
-
-# ============================================================
-# HEADER CONSOLIDATE DATA
-# ============================================================
-#
-# Features
-# 1. Select an Excel workbook.
-# 2. Select/preview any worksheet in a popup.
-# 3. Excel-like filtering in the preview popup.
-# 4. Optional filtered rows can be used for consolidation.
-# 5. Read all worksheet headers.
-# 6. Automatically suggest equivalent headers with confidence.
-# 7. Manually map headers using colors.
-# 8. Same color + different header names = warning only.
-# 9. No person/record matching, deduplication, or row merging.
-# 10. Every source row is preserved unless the user explicitly
-#     chooses to consolidate only filtered rows.
-# 11. Add "Source Sheet" to every consolidated row.
-#
-# Requirements:
-#     pip install pandas openpyxl
-#
-# ============================================================
-
+from difflib import SequenceMatcher
 
 APP_TITLE = "Header Consolidate Data"
 
@@ -47,989 +22,273 @@ COLORS = OrderedDict([
     ("Grey", "#D9D9D9"),
 ])
 
-# Colors used only for displaying automatic suggestions.
-AUTO_GROUP_COLORS = [
+# Common header aliases. These are used only for HEADER correspondence,
+# never for person/record matching.
+HEADER_ALIASES = {
+    "document_id": {
+        "document id", "document no", "document number", "doc id",
+        "doc no", "doc number", "documentid", "documentno", "documentnumber"
+    },
+    "name": {
+        "name", "full name", "customer name", "client name",
+        "person name", "applicant name", "member name"
+    },
+    "tin": {
+        "tin", "tin number", "tax number", "tax no", "tax id",
+        "tax identification number", "tin no", "tin id"
+    },
+    "ssn": {
+        "ssn", "ssn number", "ssn no", "social security number"
+    },
+    "dl": {
+        "dl", "dl number", "dl no", "driver license",
+        "driver license number", "driving license", "driving licence",
+        "drivers license", "drivers license number"
+    },
+    "dob": {
+        "dob", "date of birth", "birth date", "birthdate"
+    },
+    "provider_id": {
+        "provider id", "provider no", "provider number", "providerid"
+    },
+}
+
+AUTO_COLORS = [
     "Yellow", "Blue", "Green", "Orange", "Pink",
     "Purple", "Red", "Light Blue", "Light Green", "Grey"
 ]
 
-# Common header aliases. This is intentionally conservative.
-HEADER_ALIASES = {
-    "documentid": "Document ID",
-    "documentno": "Document ID",
-    "documentnumber": "Document ID",
-    "docid": "Document ID",
-    "docno": "Document ID",
-    "docnumber": "Document ID",
-
-    "name": "Name",
-    "fullname": "Name",
-    "individualname": "Name",
-    "personname": "Name",
-    "customername": "Name",
-    "membername": "Name",
-
-    "firstname": "First Name",
-    "fname": "First Name",
-
-    "middlename": "Middle Name",
-    "mname": "Middle Name",
-
-    "lastname": "Last Name",
-    "lname": "Last Name",
-    "surname": "Last Name",
-    "familyname": "Last Name",
-
-    "tin": "TIN",
-    "tinnumber": "TIN",
-    "taxnumber": "TIN",
-    "taxid": "TIN",
-    "taxidentificationnumber": "TIN",
-
-    "ssn": "SSN",
-    "ssnnumber": "SSN",
-    "socialsecuritynumber": "SSN",
-
-    "dob": "DOB",
-    "dateofbirth": "DOB",
-    "birthdate": "DOB",
-    "birthdt": "DOB",
-
-    "providerid": "Provider ID",
-    "providernumber": "Provider ID",
-    "providerno": "Provider ID",
-    "providernum": "Provider ID",
-
-    "dl": "DL",
-    "dlnumber": "DL",
-    "driverslicense": "DL",
-    "driverslicensenumber": "DL",
-    "drivinglicensenumber": "DL",
-
-    "phone": "Phone",
-    "phonenumber": "Phone",
-    "mobilenumber": "Phone",
-    "mobile": "Phone",
-    "telephone": "Phone",
-
-    "email": "Email",
-    "emailaddress": "Email",
-
-    "address": "Address",
-    "address1": "Address",
-    "streetaddress": "Address",
-
-    "city": "City",
-    "state": "State",
-    "zipcode": "ZIP Code",
-    "zip": "ZIP Code",
-    "postalcode": "ZIP Code",
-    "postcode": "ZIP Code",
-
-    "gender": "Gender",
-    "sex": "Gender",
-
-    "status": "Status",
-}
-
 
 def normalize_header(value):
-    """Normalize a header for automatic comparison."""
-    text = "" if value is None else str(value)
-    text = text.lower().strip()
-    text = re.sub(r"[^a-z0-9]+", "", text)
+    """Normalize a header for semantic comparison."""
+    text = str(value).strip().lower()
+    text = text.replace("&", " and ")
+    text = re.sub(r"[_\-./]+", " ", text)
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def clean_display_value(value):
-    if pd.isna(value):
-        return ""
-    return str(value)
+def compact_header(value):
+    return re.sub(r"[^a-z0-9]", "", normalize_header(value))
+
+
+def alias_key(header):
+    norm = normalize_header(header)
+    compact = compact_header(header)
+
+    for key, aliases in HEADER_ALIASES.items():
+        if norm in aliases or compact in {compact_header(x) for x in aliases}:
+            return key
+    return None
 
 
 def header_similarity(a, b):
-    """Return a 0-100 similarity score."""
     na = normalize_header(a)
     nb = normalize_header(b)
-
     if not na or not nb:
         return 0.0
 
-    if na == nb:
-        return 100.0
-
-    if na in HEADER_ALIASES and HEADER_ALIASES[na] == HEADER_ALIASES.get(nb, ""):
-        return 100.0
-
-    if HEADER_ALIASES.get(na) and HEADER_ALIASES.get(na) == b:
-        return 98.0
-
-    if HEADER_ALIASES.get(nb) and HEADER_ALIASES.get(nb) == a:
-        return 98.0
-
-    # Compare canonical alias names.
-    ca = HEADER_ALIASES.get(na, na)
-    cb = HEADER_ALIASES.get(nb, nb)
-
-    if ca == cb:
-        return 96.0
-
-    ratio = difflib.SequenceMatcher(None, na, nb).ratio() * 100
-    canonical_ratio = difflib.SequenceMatcher(
-        None,
-        normalize_header(ca),
-        normalize_header(cb)
-    ).ratio() * 100
-
-    # A modest boost for meaningful token overlap.
-    token_a = set(re.findall(r"[a-z]+", str(a).lower()))
-    token_b = set(re.findall(r"[a-z]+", str(b).lower()))
-
-    overlap = 0.0
-    if token_a and token_b:
-        overlap = (
-            len(token_a & token_b) /
-            max(len(token_a | token_b), 1)
-        ) * 100
-
-    return max(ratio, canonical_ratio, overlap)
-
-
-def best_header_match(header, all_unique_headers):
-    """Return (suggestion, confidence)."""
-    if not all_unique_headers:
-        return header, 100.0
-
-    best = None
-    best_score = -1
-
-    for candidate in all_unique_headers:
-        score = header_similarity(header, candidate)
-        if score > best_score:
-            best_score = score
-            best = candidate
-
-    # Avoid presenting weak fuzzy guesses as strong matches.
-    if best_score < 55:
-        return "", best_score
-
-    return best, best_score
-
-
-class FilterPopup(tk.Toplevel):
-    """
-    Excel-style-ish worksheet filter popup.
-
-    The popup provides:
-      - worksheet selector
-      - global search
-      - per-column filter dropdown
-      - select all / clear
-      - filtered row count
-      - checkbox to use filtered rows for consolidation
-    """
-
-    def __init__(self, parent, sheet_data, initial_sheet=None,
-                 filtered_rows_by_sheet=None):
-        super().__init__(parent)
-
-        self.parent = parent
-        self.sheet_data = sheet_data
-        self.filtered_rows_by_sheet = filtered_rows_by_sheet or {}
-
-        self.title("Select Sheet & Filter Data")
-        self.geometry("1400x800")
-        self.minsize(1050, 650)
-        self.transient(parent)
-        self.grab_set()
-
-        self.current_sheet = initial_sheet or (
-            next(iter(sheet_data)) if sheet_data else None
-        )
-
-        self.current_df = pd.DataFrame()
-        self.base_df = pd.DataFrame()
-        self.filtered_df = pd.DataFrame()
-
-        self.filter_values = {}
-        self.column_filters = {}
-        self.column_filter_vars = {}
-
-        self.search_var = tk.StringVar()
-        self.status_var = tk.StringVar()
-        self.use_filter_var = tk.BooleanVar(value=False)
-
-        self.result = None
-
-        self.create_ui()
-
-        if self.current_sheet:
-            self.load_sheet(self.current_sheet)
-
-        self.protocol("WM_DELETE_WINDOW", self.cancel)
-
-    def create_ui(self):
-        top = ttk.Frame(self, padding=10)
-        top.pack(fill="x")
-
-        ttk.Label(
-            top,
-            text="Sheet:",
-            font=("Segoe UI", 10, "bold")
-        ).pack(side="left")
-
-        self.sheet_var = tk.StringVar(value=self.current_sheet or "")
-
-        self.sheet_combo = ttk.Combobox(
-            top,
-            textvariable=self.sheet_var,
-            values=list(self.sheet_data.keys()),
-            state="readonly",
-            width=35
-        )
-        self.sheet_combo.pack(side="left", padx=(7, 15))
-        self.sheet_combo.bind("<<ComboboxSelected>>", self.on_sheet_changed)
-
-        ttk.Label(
-            top,
-            text="Search all columns:"
-        ).pack(side="left")
-
-        search_entry = ttk.Entry(
-            top,
-            textvariable=self.search_var,
-            width=35
-        )
-        search_entry.pack(side="left", padx=7)
-        search_entry.bind("<KeyRelease>", lambda e: self.apply_filters())
-
-        ttk.Button(
-            top,
-            text="Clear All Filters",
-            command=self.clear_all_filters
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            top,
-            text="Refresh",
-            command=self.apply_filters
-        ).pack(side="left", padx=5)
-
-        # Filter controls.
-        filter_frame = ttk.LabelFrame(
-            self,
-            text="Column Filters",
-            padding=8
-        )
-        filter_frame.pack(fill="x", padx=10, pady=(0, 8))
-
-        self.filter_canvas = tk.Canvas(
-            filter_frame,
-            height=85,
-            highlightthickness=0
-        )
-        self.filter_scroll = ttk.Scrollbar(
-            filter_frame,
-            orient="horizontal",
-            command=self.filter_canvas.xview
-        )
-
-        self.filter_inner = ttk.Frame(self.filter_canvas)
-        self.filter_window = self.filter_canvas.create_window(
-            (0, 0),
-            window=self.filter_inner,
-            anchor="nw"
-        )
-
-        self.filter_inner.bind(
-            "<Configure>",
-            lambda e: self.filter_canvas.configure(
-                scrollregion=self.filter_canvas.bbox("all")
-            )
-        )
-
-        self.filter_canvas.configure(
-            xscrollcommand=self.filter_scroll.set
-        )
-
-        self.filter_canvas.pack(
-            fill="x",
-            expand=True,
-            side="top"
-        )
-        self.filter_scroll.pack(
-            fill="x",
-            side="bottom"
-        )
-
-        # Data table.
-        table_frame = ttk.Frame(self, padding=(10, 0, 10, 0))
-        table_frame.pack(fill="both", expand=True)
-
-        self.tree = ttk.Treeview(
-            table_frame,
-            show="headings",
-            selectmode="browse"
-        )
-
-        sy = ttk.Scrollbar(
-            table_frame,
-            orient="vertical",
-            command=self.tree.yview
-        )
-        sx = ttk.Scrollbar(
-            table_frame,
-            orient="horizontal",
-            command=self.tree.xview
-        )
-
-        self.tree.configure(
-            yscrollcommand=sy.set,
-            xscrollcommand=sx.set
-        )
-
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        sy.grid(row=0, column=1, sticky="ns")
-        sx.grid(row=1, column=0, sticky="ew")
-
-        table_frame.rowconfigure(0, weight=1)
-        table_frame.columnconfigure(0, weight=1)
-
-        # Bottom controls.
-        bottom = ttk.Frame(self, padding=10)
-        bottom.pack(fill="x")
-
-        ttk.Label(
-            bottom,
-            textvariable=self.status_var
-        ).pack(side="left")
-
-        ttk.Checkbutton(
-            bottom,
-            text="Use filtered rows for FINAL CONSOLIDATE",
-            variable=self.use_filter_var
-        ).pack(side="left", padx=25)
-
-        ttk.Button(
-            bottom,
-            text="Cancel",
-            command=self.cancel
-        ).pack(side="right", padx=5)
-
-        ttk.Button(
-            bottom,
-            text="Apply / Continue",
-            command=self.apply_and_close
-        ).pack(side="right", padx=5)
-
-    def on_sheet_changed(self, event=None):
-        sheet = self.sheet_var.get()
-        if sheet:
-            self.load_sheet(sheet)
-
-    def load_sheet(self, sheet):
-        self.current_sheet = sheet
-        self.base_df = self.sheet_data[sheet].copy()
-
-        if sheet in self.filtered_rows_by_sheet:
-            previous = self.filtered_rows_by_sheet[sheet]
-            if len(previous) == len(self.base_df):
-                self.use_filter_var.set(False)
-
-        self.search_var.set("")
-        self.column_filters = {}
-        self.build_filter_controls()
-        self.apply_filters()
-
-    def build_filter_controls(self):
-        for widget in self.filter_inner.winfo_children():
-            widget.destroy()
-
-        self.column_filter_vars = {}
-
-        for index, column in enumerate(self.base_df.columns):
-            cell = ttk.Frame(
-                self.filter_inner,
-                relief="groove",
-                padding=5
-            )
-            cell.grid(row=0, column=index, padx=4, pady=2, sticky="n")
-
-            ttk.Label(
-                cell,
-                text=str(column),
-                font=("Segoe UI", 9, "bold")
-            ).pack(anchor="w")
-
-            values = self.base_df[column].map(
-                clean_display_value
-            ).drop_duplicates().tolist()
-
-            # Keep a practical list while still allowing all values.
-            values = sorted(
-                values,
-                key=lambda x: x.lower()
-            )
-
-            combo_values = ["(All)"] + values
-
-            var = tk.StringVar(value="(All)")
-            combo = ttk.Combobox(
-                cell,
-                textvariable=var,
-                values=combo_values,
-                state="readonly",
-                width=22
-            )
-            combo.pack()
-            combo.bind(
-                "<<ComboboxSelected>>",
-                lambda e: self.apply_filters()
-            )
-
-            self.column_filter_vars[str(column)] = var
-
-    def apply_filters(self):
-        if self.base_df is None or self.base_df.empty:
-            self.filtered_df = self.base_df.copy()
-            self.populate_table()
-            self.status_var.set("0 rows")
-            return
-
-        df = self.base_df.copy()
-
-        # Global search.
-        search_text = self.search_var.get().strip().lower()
-        if search_text:
-            mask = pd.Series(False, index=df.index)
-
-            for column in df.columns:
-                mask = mask | df[column].map(
-                    clean_display_value
-                ).str.lower().str.contains(
-                    re.escape(search_text),
-                    na=False
-                )
-
-            df = df[mask]
-
-        # Per-column filters.
-        for column, var in self.column_filter_vars.items():
-            selected = var.get()
-
-            if selected and selected != "(All)":
-                df = df[
-                    df[column].map(clean_display_value) == selected
-                ]
-
-        self.filtered_df = df
-        self.populate_table()
-
-        self.status_var.set(
-            f"Sheet: {self.current_sheet}    "
-            f"Showing {len(df):,} of {len(self.base_df):,} rows"
-        )
-
-    def populate_table(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        columns = [str(c) for c in self.base_df.columns]
-        self.tree["columns"] = columns
-
-        for column in columns:
-            self.tree.heading(column, text=column)
-            self.tree.column(
-                column,
-                width=150,
-                minwidth=90,
-                anchor="w"
-            )
-
-        for _, row in self.filtered_df.iterrows():
-            values = [
-                clean_display_value(row[c])
-                for c in self.base_df.columns
-            ]
-            self.tree.insert("", "end", values=values)
-
-    def clear_all_filters(self):
-        self.search_var.set("")
-
-        for var in self.column_filter_vars.values():
-            var.set("(All)")
-
-        self.apply_filters()
-
-    def apply_and_close(self):
-        if self.current_sheet:
-            self.filtered_rows_by_sheet[self.current_sheet] = (
-                self.filtered_df.copy()
-            )
-
-        self.result = {
-            "selected_sheet": self.current_sheet,
-            "filtered_rows_by_sheet": self.filtered_rows_by_sheet,
-            "use_filtered_rows": self.use_filter_var.get()
-        }
-
-        self.destroy()
-
-    def cancel(self):
-        self.result = None
-        self.destroy()
-
-
-class HeaderMappingPopup(tk.Toplevel):
-    """
-    Displays all headers and automatic suggestions before the
-    main color-mapping interface is used.
-    """
-
-    def __init__(self, parent, sheet_headers):
-        super().__init__(parent)
-
-        self.parent = parent
-        self.sheet_headers = sheet_headers
-
-        self.title("Automatic Header Identification")
-        self.geometry("1250x700")
-        self.minsize(950, 550)
-        self.transient(parent)
-        self.grab_set()
-
-        self.create_ui()
-
-    def create_ui(self):
-        top = ttk.Frame(self, padding=12)
-        top.pack(fill="x")
-
-        ttk.Label(
-            top,
-            text="Automatic Header Identification",
-            font=("Segoe UI", 16, "bold")
-        ).pack(anchor="w")
-
-        ttk.Label(
-            top,
-            text=(
-                "The program compares header names across all sheets. "
-                "Review the suggested equivalent header and confidence "
-                "before using the manual color mapping."
-            ),
-            wraplength=1100
-        ).pack(anchor="w", pady=(5, 10))
-
-        frame = ttk.Frame(self, padding=(12, 0, 12, 0))
-        frame.pack(fill="both", expand=True)
-
-        columns = (
-            "sheet",
-            "column",
-            "original",
-            "suggestion",
-            "confidence"
-        )
-
-        tree = ttk.Treeview(
-            frame,
-            columns=columns,
-            show="headings"
-        )
-
-        headings = {
-            "sheet": "Sheet",
-            "column": "Column",
-            "original": "Original Header",
-            "suggestion": "Automatically Identified As",
-            "confidence": "Confidence"
-        }
-
-        widths = {
-            "sheet": 190,
-            "column": 90,
-            "original": 280,
-            "suggestion": 300,
-            "confidence": 130
-        }
-
-        for col in columns:
-            tree.heading(col, text=headings[col])
-            tree.column(col, width=widths[col], anchor="w")
-
-        sy = ttk.Scrollbar(
-            frame,
-            orient="vertical",
-            command=tree.yview
-        )
-        sx = ttk.Scrollbar(
-            frame,
-            orient="horizontal",
-            command=tree.xview
-        )
-
-        tree.configure(
-            yscrollcommand=sy.set,
-            xscrollcommand=sx.set
-        )
-
-        tree.grid(row=0, column=0, sticky="nsew")
-        sy.grid(row=0, column=1, sticky="ns")
-        sx.grid(row=1, column=0, sticky="ew")
-
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-        unique_headers = []
-        for headers in self.sheet_headers.values():
-            for info in headers:
-                h = info["original_header"]
-                if h not in unique_headers:
-                    unique_headers.append(h)
-
-        for sheet_name, headers in self.sheet_headers.items():
-            for info in headers:
-                suggestion, score = best_header_match(
-                    info["original_header"],
-                    unique_headers
-                )
-
-                # Don't suggest itself as a different mapping.
-                if suggestion == info["original_header"]:
-                    display_suggestion = suggestion
-                elif not suggestion:
-                    display_suggestion = "No reliable match"
-                else:
-                    display_suggestion = suggestion
-
-                tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        sheet_name,
-                        self.parent.column_letter(
-                            info["column_index"]
-                        ),
-                        info["original_header"],
-                        display_suggestion,
-                        f"{score:.1f}%"
-                    )
-                )
-
-        bottom = ttk.Frame(self, padding=12)
-        bottom.pack(fill="x")
-
-        ttk.Label(
-            bottom,
-            text=(
-                "Automatic identification is a suggestion only. "
-                "You can still assign the final colors manually."
-            )
-        ).pack(side="left")
-
-        ttk.Button(
-            bottom,
-            text="Close",
-            command=self.destroy
-        ).pack(side="right")
+    ka = alias_key(a)
+    kb = alias_key(b)
+
+    # Strong semantic match when both headers belong to the same known group.
+    if ka and kb and ka == kb:
+        return 1.0
+
+    # Never treat different known semantic groups as a match.
+    if ka and kb and ka != kb:
+        return 0.0
+
+    ca = compact_header(a)
+    cb = compact_header(b)
+    return SequenceMatcher(None, ca, cb).ratio()
 
 
 class HeaderConsolidatorApp:
-    # ========================================================
-    # INITIALIZATION
-    # ========================================================
-
     def __init__(self, root):
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1250x800")
-        self.root.minsize(1050, 700)
+        self.root.geometry("1450x850")
+        self.root.minsize(1100, 700)
 
         self.file_path = None
         self.output_path = None
-
         self.sheet_headers = OrderedDict()
         self.tree_metadata = {}
         self.selected_item = None
 
-        # Full data for every worksheet.
-        self.sheet_data = OrderedDict()
-
-        # Optional filtered data selected in filter popup.
-        self.filtered_rows_by_sheet = OrderedDict()
-
-        # If True, FINAL CONSOLIDATE uses filtered rows.
-        self.use_filtered_rows = False
+        self.sheet_filter_var = tk.StringVar(value="All Sheets")
+        self.header_filter_var = tk.StringVar(value="")
+        self.color_filter_var = tk.StringVar(value="All Colors")
+        self.color_var = tk.StringVar(value="None")
 
         self.create_styles()
         self.create_ui()
 
-    # ========================================================
-    # STYLES
-    # ========================================================
-
+    # ------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------
     def create_styles(self):
         style = ttk.Style()
-
         try:
             style.theme_use("clam")
         except Exception:
             pass
 
-        style.configure(
-            "Title.TLabel",
-            font=("Segoe UI", 20, "bold")
-        )
-
-        style.configure(
-            "Subtitle.TLabel",
-            font=("Segoe UI", 10)
-        )
-
-        style.configure(
-            "Header.TLabel",
-            font=("Segoe UI", 11, "bold")
-        )
-
-        style.configure(
-            "Action.TButton",
-            font=("Segoe UI", 10, "bold"),
-            padding=8
-        )
-
-    # ========================================================
-    # CREATE UI
-    # ========================================================
+        style.configure("Title.TLabel", font=("Segoe UI", 20, "bold"))
+        style.configure("Subtitle.TLabel", font=("Segoe UI", 10))
+        style.configure("Header.TLabel", font=("Segoe UI", 10, "bold"))
+        style.configure("Action.TButton", font=("Segoe UI", 10, "bold"), padding=8)
 
     def create_ui(self):
-        top_frame = ttk.Frame(self.root, padding=15)
-        top_frame.pack(fill="x")
+        top = ttk.Frame(self.root, padding=15)
+        top.pack(fill="x")
 
         ttk.Label(
-            top_frame,
-            text="Header Consolidate Data",
-            style="Title.TLabel"
+            top, text=APP_TITLE, style="Title.TLabel"
         ).pack(anchor="w")
 
         ttk.Label(
-            top_frame,
+            top,
             text=(
-                "Automatically review headers, filter worksheet data, "
-                "map corresponding headers using colors, and consolidate "
-                "all rows with a Source Sheet reference."
+                "Map corresponding Excel headers using colors, keep every source row, "
+                "and add the originating Sheet Name for reference."
             ),
             style="Subtitle.TLabel"
         ).pack(anchor="w", pady=(3, 10))
 
-        # File selection.
         file_frame = ttk.LabelFrame(
-            self.root,
-            text="1. Select Excel File",
-            padding=12
+            self.root, text="1. Select Excel File", padding=12
         )
-        file_frame.pack(
-            fill="x",
-            padx=15,
-            pady=(0, 8)
-        )
+        file_frame.pack(fill="x", padx=15, pady=(0, 8))
 
         self.file_label = ttk.Label(
-            file_frame,
-            text="No Excel file selected.",
-            foreground="gray"
+            file_frame, text="No Excel file selected.", foreground="gray"
         )
-        self.file_label.pack(
-            side="left",
-            fill="x",
-            expand=True
+        self.file_label.pack(side="left", fill="x", expand=True)
+
+        ttk.Button(
+            file_frame, text="Select Excel File",
+            command=self.select_file, style="Action.TButton"
+        ).pack(side="right")
+
+        mapping = ttk.LabelFrame(
+            self.root, text="2. Header Mapping / Filtering", padding=10
+        )
+        mapping.pack(fill="both", expand=True, padx=15, pady=(0, 8))
+
+        instruction = (
+            "Use the filters like an Excel-style view to find headers quickly. "
+            "You can manually assign colors or use AUTO IDENTIFY HEADERS. "
+            "Same-color headers become one output field. Color is only a header "
+            "correspondence key — never a record/person matching key."
+        )
+        ttk.Label(mapping, text=instruction, justify="left").pack(
+            anchor="w", pady=(0, 8)
+        )
+
+        filter_frame = ttk.Frame(mapping)
+        filter_frame.pack(fill="x", pady=(0, 8))
+
+        ttk.Label(filter_frame, text="Sheet:").pack(side="left")
+        self.sheet_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.sheet_filter_var,
+            state="readonly",
+            width=28
+        )
+        self.sheet_combo.pack(side="left", padx=(5, 15))
+        self.sheet_combo.bind("<<ComboboxSelected>>", lambda e: self.apply_filters())
+
+        ttk.Label(filter_frame, text="Header Search:").pack(side="left")
+        self.header_entry = ttk.Entry(
+            filter_frame, textvariable=self.header_filter_var, width=30
+        )
+        self.header_entry.pack(side="left", padx=(5, 15))
+        self.header_entry.bind("<KeyRelease>", lambda e: self.apply_filters())
+
+        ttk.Label(filter_frame, text="Color:").pack(side="left")
+        self.color_filter_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.color_filter_var,
+            values=["All Colors"] + list(COLORS.keys()),
+            state="readonly",
+            width=18
+        )
+        self.color_filter_combo.pack(side="left", padx=5)
+        self.color_filter_combo.bind(
+            "<<ComboboxSelected>>", lambda e: self.apply_filters()
         )
 
         ttk.Button(
-            file_frame,
-            text="Select Excel File",
-            command=self.select_file,
+            filter_frame, text="Clear Filters",
+            command=self.clear_filters
+        ).pack(side="left", padx=8)
+
+        ttk.Button(
+            filter_frame, text="AUTO IDENTIFY HEADERS",
+            command=self.auto_identify_headers,
             style="Action.TButton"
         ).pack(side="right")
 
-        # Sheet/filter controls.
-        data_frame = ttk.LabelFrame(
-            self.root,
-            text="2. Sheet Selection & Excel-Style Data Filter",
-            padding=10
-        )
-        data_frame.pack(
-            fill="x",
-            padx=15,
-            pady=(0, 8)
-        )
-
-        self.selected_sheet_var = tk.StringVar(
-            value="No sheet selected"
-        )
-
-        ttk.Label(
-            data_frame,
-            textvariable=self.selected_sheet_var,
-            font=("Segoe UI", 10, "bold")
-        ).pack(side="left", padx=(0, 15))
-
-        ttk.Button(
-            data_frame,
-            text="Open Sheet & Filter Popup",
-            command=self.open_filter_popup
-        ).pack(side="left", padx=5)
-
-        ttk.Button(
-            data_frame,
-            text="View Automatic Header Identification",
-            command=self.open_auto_header_popup
-        ).pack(side="left", padx=5)
-
-        self.filter_status_var = tk.StringVar(
-            value="All rows will be used unless filtering is enabled."
-        )
-
-        ttk.Label(
-            data_frame,
-            textvariable=self.filter_status_var,
-            foreground="gray"
-        ).pack(side="right")
-
-        # Mapping area.
-        instruction_frame = ttk.LabelFrame(
-            self.root,
-            text="3. Header Color Mapping",
-            padding=10
-        )
-        instruction_frame.pack(
-            fill="both",
-            expand=True,
-            padx=15,
-            pady=(0, 8)
-        )
-
-        instruction = (
-            "Assign the SAME color to headers that represent the same "
-            "logical field across sheets. Automatic header identification "
-            "is shown separately as a suggestion.\n\n"
-            "Example: Document ID and Document Number can both be Yellow.\n\n"
-            "If the same color is assigned to different header names, "
-            "the program shows a warning. You can still continue."
-        )
-
-        ttk.Label(
-            instruction_frame,
-            text=instruction,
-            justify="left"
-        ).pack(anchor="w", pady=(0, 8))
-
-        table_frame = ttk.Frame(instruction_frame)
+        table_frame = ttk.Frame(mapping)
         table_frame.pack(fill="both", expand=True)
 
-        columns = (
-            "sheet",
-            "column",
-            "header",
-            "auto",
-            "confidence",
-            "color"
-        )
-
+        columns = ("sheet", "column", "header", "suggestion", "color")
         self.tree = ttk.Treeview(
-            table_frame,
-            columns=columns,
-            show="headings",
-            selectmode="browse"
+            table_frame, columns=columns, show="headings", selectmode="browse"
         )
 
         headings = {
             "sheet": "Sheet",
             "column": "Column",
             "header": "Header Name",
-            "auto": "Auto Identified As",
-            "confidence": "Confidence",
-            "color": "Assigned Color"
+            "suggestion": "Automatic Match / Suggestion",
+            "color": "Assigned Color",
+        }
+        widths = {
+            "sheet": 180,
+            "column": 80,
+            "header": 280,
+            "suggestion": 330,
+            "color": 160,
         }
 
         for col in columns:
             self.tree.heading(col, text=headings[col])
-
-        self.tree.column("sheet", width=170)
-        self.tree.column("column", width=75)
-        self.tree.column("header", width=250)
-        self.tree.column("auto", width=250)
-        self.tree.column("confidence", width=100)
-        self.tree.column("color", width=140)
+            self.tree.column(col, width=widths[col], anchor="w")
 
         scrollbar_y = ttk.Scrollbar(
-            table_frame,
-            orient="vertical",
-            command=self.tree.yview
+            table_frame, orient="vertical", command=self.tree.yview
         )
-
         scrollbar_x = ttk.Scrollbar(
-            table_frame,
-            orient="horizontal",
-            command=self.tree.xview
+            table_frame, orient="horizontal", command=self.tree.xview
         )
-
         self.tree.configure(
             yscrollcommand=scrollbar_y.set,
             xscrollcommand=scrollbar_x.set
         )
 
-        self.tree.grid(
-            row=0,
-            column=0,
-            sticky="nsew"
-        )
-
-        scrollbar_y.grid(
-            row=0,
-            column=1,
-            sticky="ns"
-        )
-
-        scrollbar_x.grid(
-            row=1,
-            column=0,
-            sticky="ew"
-        )
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar_y.grid(row=0, column=1, sticky="ns")
+        scrollbar_x.grid(row=1, column=0, sticky="ew")
 
         table_frame.rowconfigure(0, weight=1)
         table_frame.columnconfigure(0, weight=1)
 
-        self.tree.bind(
-            "<<TreeviewSelect>>",
-            self.on_header_select
-        )
+        self.tree.bind("<<TreeviewSelect>>", self.on_header_select)
 
-        # Color controls.
-        color_frame = ttk.Frame(instruction_frame)
-        color_frame.pack(fill="x", pady=(10, 0))
+        color_frame = ttk.Frame(mapping)
+        color_frame.pack(fill="x", pady=(8, 0))
 
-        ttk.Label(
-            color_frame,
-            text="Selected Header:"
-        ).pack(side="left")
-
+        ttk.Label(color_frame, text="Selected Header:").pack(side="left")
         self.selected_header_label = ttk.Label(
-            color_frame,
-            text="None",
-            font=("Segoe UI", 10, "bold")
+            color_frame, text="None", font=("Segoe UI", 10, "bold")
         )
-        self.selected_header_label.pack(
-            side="left",
-            padx=(5, 20)
-        )
+        self.selected_header_label.pack(side="left", padx=(5, 20))
 
-        ttk.Label(
-            color_frame,
-            text="Color:"
-        ).pack(side="left")
-
-        self.color_var = tk.StringVar(value="None")
-
+        ttk.Label(color_frame, text="Color:").pack(side="left")
         self.color_combo = ttk.Combobox(
             color_frame,
             textvariable=self.color_var,
@@ -1037,70 +296,43 @@ class HeaderConsolidatorApp:
             state="readonly",
             width=18
         )
-        self.color_combo.pack(
-            side="left",
-            padx=8
-        )
-
-        self.color_combo.bind(
-            "<<ComboboxSelected>>",
-            self.apply_color
-        )
+        self.color_combo.pack(side="left", padx=8)
+        self.color_combo.bind("<<ComboboxSelected>>", self.apply_color)
 
         ttk.Button(
-            color_frame,
-            text="Apply Color",
+            color_frame, text="Apply Color",
             command=self.apply_color
         ).pack(side="left")
 
-        # Bottom buttons.
-        bottom_frame = ttk.Frame(
-            self.root,
-            padding=(15, 0, 15, 15)
-        )
-        bottom_frame.pack(fill="x")
+        bottom = ttk.Frame(self.root, padding=(15, 0, 15, 15))
+        bottom.pack(fill="x")
 
         ttk.Button(
-            bottom_frame,
-            text="Validate Mapping",
+            bottom, text="Validate Mapping",
             command=self.validate_mapping,
             style="Action.TButton"
         ).pack(side="left", padx=(0, 8))
 
         ttk.Button(
-            bottom_frame,
-            text="Clear Mapping",
+            bottom, text="Clear Mapping",
             command=self.clear_mapping
         ).pack(side="left")
 
         ttk.Button(
-            bottom_frame,
-            text="FINAL CONSOLIDATE",
+            bottom, text="FINAL CONSOLIDATE",
             command=self.final_consolidate,
             style="Action.TButton"
         ).pack(side="right")
 
-        self.status_var = tk.StringVar(
-            value="Please select an Excel file."
-        )
+        self.status_var = tk.StringVar(value="Please select an Excel file.")
+        ttk.Label(
+            self.root, textvariable=self.status_var,
+            relief="sunken", anchor="w", padding=5
+        ).pack(side="bottom", fill="x")
 
-        status_label = ttk.Label(
-            self.root,
-            textvariable=self.status_var,
-            relief="sunken",
-            anchor="w",
-            padding=5
-        )
-
-        status_label.pack(
-            side="bottom",
-            fill="x"
-        )
-
-    # ========================================================
-    # SELECT EXCEL FILE
-    # ========================================================
-
+    # ------------------------------------------------------------
+    # File loading
+    # ------------------------------------------------------------
     def select_file(self):
         path = filedialog.askopenfilename(
             title="Select Excel Workbook",
@@ -1108,25 +340,15 @@ class HeaderConsolidatorApp:
                 ("Excel Files", "*.xlsx *.xlsm"),
                 ("Excel Workbook", "*.xlsx"),
                 ("Excel Macro Workbook", "*.xlsm"),
-                ("All Files", "*.*")
+                ("All Files", "*.*"),
             ]
         )
-
         if not path:
             return
 
         self.file_path = path
-
-        self.file_label.config(
-            text=os.path.basename(path),
-            foreground="black"
-        )
-
+        self.file_label.config(text=os.path.basename(path), foreground="black")
         self.load_workbook_headers()
-
-    # ========================================================
-    # LOAD WORKBOOK
-    # ========================================================
 
     def load_workbook_headers(self):
         try:
@@ -1134,37 +356,25 @@ class HeaderConsolidatorApp:
             self.root.update_idletasks()
 
             excel = pd.ExcelFile(self.file_path)
-
             self.sheet_headers.clear()
-            self.sheet_data.clear()
-            self.filtered_rows_by_sheet.clear()
 
             for sheet_name in excel.sheet_names:
                 df = pd.read_excel(
-                    self.file_path,
-                    sheet_name=sheet_name,
-                    dtype=object
+                    self.file_path, sheet_name=sheet_name, nrows=0
                 )
-
-                self.sheet_data[sheet_name] = df
 
                 headers = []
                 used_names = {}
 
                 for column_index, value in enumerate(df.columns):
                     header = str(value).strip()
-
-                    if not header:
-                        header = (
-                            f"Unnamed Column {column_index + 1}"
-                        )
+                    if not header or header.lower().startswith("unnamed:"):
+                        header = f"Unnamed Column {column_index + 1}"
 
                     if header in used_names:
                         used_names[header] += 1
-
                         display_header = (
-                            f"{header} "
-                            f"(Duplicate {used_names[header]})"
+                            f"{header} (Duplicate {used_names[header]})"
                         )
                     else:
                         used_names[header] = 1
@@ -1174,220 +384,233 @@ class HeaderConsolidatorApp:
                         "column_index": column_index,
                         "header": display_header,
                         "original_header": header,
-                        "color": "None"
+                        "color": "None",
+                        "suggestion": self.get_semantic_suggestion(header),
                     })
 
                 self.sheet_headers[sheet_name] = headers
 
+            self.update_sheet_filter_values()
             self.populate_tree()
 
             total_headers = sum(
-                len(headers)
-                for headers in self.sheet_headers.values()
+                len(headers) for headers in self.sheet_headers.values()
             )
-
             self.status_var.set(
-                f"Loaded {len(self.sheet_headers)} sheet(s) "
-                f"and {total_headers} header(s)."
+                f"Loaded {len(self.sheet_headers)} sheet(s) and "
+                f"{total_headers} header(s)."
             )
 
-            if self.sheet_headers:
-                first_sheet = next(
-                    iter(self.sheet_headers.keys())
-                )
-                self.selected_sheet_var.set(
-                    f"Selected sheet: {first_sheet}"
-                )
-
-                self.filter_status_var.set(
-                    "All rows will be used. "
-                    "Use the Sheet & Filter popup if required."
-                )
-
-                # Show automatic identification immediately.
-                self.root.after(
-                    150,
-                    self.open_auto_header_popup
+            if not self.sheet_headers:
+                messagebox.showwarning(
+                    "No Sheets", "The workbook does not contain any worksheets."
                 )
 
         except Exception as e:
             messagebox.showerror(
                 "Error Reading Excel",
-                "Unable to read the workbook.\n\n"
-                f"{type(e).__name__}: {e}"
+                f"Unable to read the workbook.\n\n{type(e).__name__}: {e}"
             )
+            self.status_var.set("Error reading workbook.")
 
-            self.status_var.set(
-                "Error reading workbook."
-            )
+    # ------------------------------------------------------------
+    # Header suggestions / automatic identification
+    # ------------------------------------------------------------
+    def get_semantic_suggestion(self, header):
+        key = alias_key(header)
+        if key:
+            pretty = {
+                "document_id": "Document ID",
+                "name": "Name",
+                "tin": "TIN",
+                "ssn": "SSN",
+                "dl": "DL",
+                "dob": "DOB",
+                "provider_id": "Provider ID",
+            }
+            return pretty.get(key, key.replace("_", " ").title())
 
-    # ========================================================
-    # AUTO HEADER SUGGESTIONS
-    # ========================================================
-
-    def get_auto_suggestion(self, header):
-        all_unique_headers = []
-
-        for headers in self.sheet_headers.values():
+        # Find a close header from the workbook after it is loaded.
+        candidates = []
+        for _, headers in self.sheet_headers.items():
             for info in headers:
-                h = info["original_header"]
+                other = info["original_header"]
+                if other == header:
+                    continue
+                score = header_similarity(header, other)
+                if score >= 0.78:
+                    candidates.append((score, other))
 
-                if h not in all_unique_headers:
-                    all_unique_headers.append(h)
+        if candidates:
+            candidates.sort(reverse=True)
+            return candidates[0][1]
 
-        suggestion, score = best_header_match(
-            header,
-            all_unique_headers
-        )
+        return "No automatic match"
 
-        if not suggestion:
-            return "No reliable match", score
-
-        return suggestion, score
-
-    def open_auto_header_popup(self):
+    def auto_identify_headers(self):
         if not self.sheet_headers:
             messagebox.showwarning(
-                "No Workbook",
-                "Please select an Excel workbook first."
+                "No Workbook", "Please select an Excel workbook first."
             )
             return
 
-        HeaderMappingPopup(
-            self.root,
-            self.sheet_headers
-        )
+        # Recalculate suggestions using all loaded headers.
+        all_headers = []
+        for _, headers in self.sheet_headers.items():
+            for info in headers:
+                all_headers.append(info["original_header"])
 
-    # ========================================================
-    # FILTER POPUP
-    # ========================================================
+        unique_headers = list(OrderedDict.fromkeys(all_headers))
+        groups = []
+        assigned = {}
 
-    def open_filter_popup(self):
-        if not self.sheet_data:
-            messagebox.showwarning(
-                "No Workbook",
-                "Please select an Excel workbook first."
-            )
-            return
+        # First use known semantic aliases.
+        for header in unique_headers:
+            key = alias_key(header)
+            if key:
+                assigned[header] = key
 
-        popup = FilterPopup(
-            self.root,
-            self.sheet_data,
-            initial_sheet=(
-                next(iter(self.sheet_data.keys()))
-                if self.sheet_data
-                else None
-            ),
-            filtered_rows_by_sheet=self.filtered_rows_by_sheet
-        )
+        # Then use conservative fuzzy grouping for otherwise-unmapped headers.
+        for header in unique_headers:
+            if header in assigned:
+                continue
 
-        self.root.wait_window(popup)
+            best_key = None
+            best_score = 0.0
 
-        if popup.result:
-            self.filtered_rows_by_sheet = (
-                popup.result["filtered_rows_by_sheet"]
-            )
+            for existing_header, key in assigned.items():
+                score = header_similarity(header, existing_header)
+                if score > best_score:
+                    best_score = score
+                    best_key = key
 
-            self.use_filtered_rows = (
-                popup.result["use_filtered_rows"]
-            )
-
-            selected_sheet = popup.result["selected_sheet"]
-
-            if selected_sheet:
-                self.selected_sheet_var.set(
-                    f"Selected sheet: {selected_sheet}"
-                )
-
-            if self.use_filtered_rows:
-                total_filtered = sum(
-                    len(df)
-                    for df in self.filtered_rows_by_sheet.values()
-                )
-
-                self.filter_status_var.set(
-                    f"FILTER MODE ON — {total_filtered:,} "
-                    f"filtered row(s) will be used."
-                )
+            if best_key and best_score >= 0.88:
+                assigned[header] = best_key
             else:
-                self.filter_status_var.set(
-                    "FILTER MODE OFF — all source rows will be used."
+                assigned[header] = f"custom_{len(groups)}_{header}"
+
+            if assigned[header].startswith("custom_"):
+                groups.append(assigned[header])
+
+        # Stable group order based on first appearance.
+        group_order = []
+        for header in unique_headers:
+            key = assigned[header]
+            if key not in group_order:
+                group_order.append(key)
+
+        color_for_group = {}
+        color_index = 0
+
+        for key in group_order:
+            # If more groups than available colors, leave additional groups None.
+            if color_index < len(AUTO_COLORS):
+                color_for_group[key] = AUTO_COLORS[color_index]
+                color_index += 1
+            else:
+                color_for_group[key] = "None"
+
+        changed = 0
+        for _, headers in self.sheet_headers.items():
+            for info in headers:
+                key = assigned.get(info["original_header"])
+                if key is None:
+                    continue
+                new_color = color_for_group.get(key, "None")
+                if info["color"] != new_color:
+                    info["color"] = new_color
+                    changed += 1
+                info["suggestion"] = self.get_group_display_name(
+                    info["original_header"], key
                 )
 
-            self.status_var.set(
-                "Sheet/filter selection updated."
-            )
+        self.populate_tree()
+        self.status_var.set(
+            f"Automatic identification completed. {changed} header mapping(s) updated."
+        )
 
-    # ========================================================
-    # POPULATE TREEVIEW
-    # ========================================================
+        messagebox.showinfo(
+            "Automatic Header Identification",
+            "Automatic header identification completed.\n\n"
+            "Please review the colors before FINAL CONSOLIDATE. "
+            "You can manually change any mapping."
+        )
 
-    def populate_tree(self):
+    def get_group_display_name(self, header, key):
+        if key in HEADER_ALIASES:
+            return key.replace("_", " ").title()
+        return "Possible Match: " + str(header)
+
+    # ------------------------------------------------------------
+    # Filtering
+    # ------------------------------------------------------------
+    def update_sheet_filter_values(self):
+        values = ["All Sheets"] + list(self.sheet_headers.keys())
+        self.sheet_combo["values"] = values
+        self.sheet_filter_var.set("All Sheets")
+
+    def clear_filters(self):
+        self.sheet_filter_var.set("All Sheets")
+        self.header_filter_var.set("")
+        self.color_filter_var.set("All Colors")
+        self.populate_tree()
+
+    def apply_filters(self):
+        sheet_filter = self.sheet_filter_var.get()
+        header_filter = normalize_header(self.header_filter_var.get())
+        color_filter = self.color_filter_var.get()
+
         for item in self.tree.get_children():
             self.tree.delete(item)
 
         self.tree_metadata.clear()
 
         for sheet_name, headers in self.sheet_headers.items():
-            for header_info in headers:
-                suggestion, score = (
-                    self.get_auto_suggestion(
-                        header_info["original_header"]
-                    )
-                )
+            if sheet_filter != "All Sheets" and sheet_name != sheet_filter:
+                continue
 
-                item_id = self.tree.insert(
-                    "",
-                    "end",
-                    values=(
-                        sheet_name,
-                        self.column_letter(
-                            header_info["column_index"]
-                        ),
-                        header_info["header"],
-                        suggestion,
-                        f"{score:.1f}%"
-                    )
-                )
+            for info in headers:
+                header_norm = normalize_header(info["header"])
+                if header_filter and header_filter not in header_norm:
+                    continue
 
-                self.tree_metadata[item_id] = (
-                    sheet_name,
-                    header_info
-                )
+                if color_filter != "All Colors" and info["color"] != color_filter:
+                    continue
 
-                self.update_tree_item_color(
-                    item_id,
-                    header_info["color"]
-                )
+                self.insert_tree_item(sheet_name, info)
 
-    # ========================================================
-    # COLUMN NUMBER TO EXCEL LETTER
-    # ========================================================
+    # ------------------------------------------------------------
+    # Treeview
+    # ------------------------------------------------------------
+    def populate_tree(self):
+        self.apply_filters()
+
+    def insert_tree_item(self, sheet_name, header_info):
+        item_id = self.tree.insert(
+            "",
+            "end",
+            values=(
+                sheet_name,
+                self.column_letter(header_info["column_index"]),
+                header_info["header"],
+                header_info.get("suggestion", "No automatic match"),
+                header_info["color"],
+            )
+        )
+
+        self.tree_metadata[item_id] = (sheet_name, header_info)
+        self.update_tree_item_color(item_id, header_info["color"])
 
     def column_letter(self, number):
         result = ""
         number += 1
-
         while number:
-            number, remainder = divmod(
-                number - 1,
-                26
-            )
-
-            result = (
-                chr(65 + remainder)
-                + result
-            )
-
+            number, remainder = divmod(number - 1, 26)
+            result = chr(65 + remainder) + result
         return result
-
-    # ========================================================
-    # HEADER SELECTED
-    # ========================================================
 
     def on_header_select(self, event=None):
         selected = self.tree.selection()
-
         if not selected:
             self.selected_item = None
             self.selected_header_label.config(text="None")
@@ -1399,163 +622,87 @@ class HeaderConsolidatorApp:
         if item_id not in self.tree_metadata:
             return
 
-        sheet_name, header_info = (
-            self.tree_metadata[item_id]
-        )
-
+        sheet_name, header_info = self.tree_metadata[item_id]
         self.selected_header_label.config(
-            text=(
-                f"{sheet_name} → "
-                f"{header_info['header']}"
-            )
+            text=f"{sheet_name} → {header_info['header']}"
         )
-
-        self.color_var.set(
-            header_info["color"]
-        )
-
-    # ========================================================
-    # APPLY COLOR
-    # ========================================================
+        self.color_var.set(header_info["color"])
 
     def apply_color(self, event=None):
         if not self.selected_item:
             messagebox.showwarning(
-                "No Header Selected",
-                "Please select a header first."
+                "No Header Selected", "Please select a header first."
             )
             return
 
-        color = self.color_var.get()
-
-        if not color:
-            color = "None"
-
-        sheet_name, header_info = (
-            self.tree_metadata[
-                self.selected_item
-            ]
-        )
-
+        color = self.color_var.get() or "None"
+        sheet_name, header_info = self.tree_metadata[self.selected_item]
         header_info["color"] = color
 
-        values = list(
-            self.tree.item(
-                self.selected_item,
-                "values"
-            )
-        )
-
-        values[5] = color
-
-        self.tree.item(
-            self.selected_item,
-            values=values
-        )
-
-        self.update_tree_item_color(
-            self.selected_item,
-            color
-        )
+        values = list(self.tree.item(self.selected_item, "values"))
+        values[4] = color
+        self.tree.item(self.selected_item, values=values)
+        self.update_tree_item_color(self.selected_item, color)
 
         self.status_var.set(
-            f"Color '{color}' assigned to "
-            f"{sheet_name} → "
-            f"{header_info['header']}"
+            f"Color '{color}' assigned to {sheet_name} → {header_info['header']}"
         )
-
-    # ========================================================
-    # UPDATE TREEVIEW COLOR
-    # ========================================================
 
     def update_tree_item_color(self, item_id, color):
-        tag_name = f"color_{color}"
-
+        tag_name = f"color_{color.replace(' ', '_')}"
         if not self.tree.tag_has(tag_name):
-            background = COLORS.get(
-                color,
-                "#FFFFFF"
-            )
-
             self.tree.tag_configure(
-                tag_name,
-                background=background
+                tag_name, background=COLORS.get(color, "#FFFFFF")
             )
+        self.tree.item(item_id, tags=(tag_name,))
 
-        self.tree.item(
-            item_id,
-            tags=(tag_name,)
-        )
-
-    # ========================================================
-    # CLEAR ALL MAPPING
-    # ========================================================
-
+    # ------------------------------------------------------------
+    # Mapping validation
+    # ------------------------------------------------------------
     def clear_mapping(self):
         if not self.sheet_headers:
             return
 
-        answer = messagebox.askyesno(
+        if not messagebox.askyesno(
             "Clear Mapping",
-            "Are you sure you want to clear all "
-            "header color mappings?"
-        )
-
-        if not answer:
+            "Are you sure you want to clear all header color mappings?"
+        ):
             return
 
         for headers in self.sheet_headers.values():
-            for header_info in headers:
-                header_info["color"] = "None"
-
-        self.populate_tree()
+            for info in headers:
+                info["color"] = "None"
 
         self.color_var.set("None")
         self.selected_header_label.config(text="None")
-
-        self.status_var.set(
-            "All color mappings cleared."
-        )
-
-    # ========================================================
-    # FIND COLOR CONFLICTS
-    # ========================================================
+        self.populate_tree()
+        self.status_var.set("All color mappings cleared.")
 
     def get_color_conflicts(self):
         color_to_headers = OrderedDict()
 
-        for sheet_name, headers in self.sheet_headers.items():
-            for header_info in headers:
-                color = header_info["color"]
-
+        for _, headers in self.sheet_headers.items():
+            for info in headers:
+                color = info["color"]
                 if color == "None":
                     continue
 
-                header = header_info["original_header"]
-
-                if color not in color_to_headers:
-                    color_to_headers[color] = []
+                header = info["original_header"]
+                color_to_headers.setdefault(color, [])
 
                 if header not in color_to_headers[color]:
                     color_to_headers[color].append(header)
 
-        conflicts = OrderedDict()
-
-        for color, headers in color_to_headers.items():
-            if len(headers) > 1:
-                conflicts[color] = headers
-
-        return conflicts
-
-    # ========================================================
-    # VALIDATE MAPPING
-    # ========================================================
+        return OrderedDict(
+            (color, headers)
+            for color, headers in color_to_headers.items()
+            if len(headers) > 1
+        )
 
     def validate_mapping(self):
         if not self.sheet_headers:
             messagebox.showwarning(
-                "No Workbook",
-                "Please select an Excel workbook first."
+                "No Workbook", "Please select an Excel workbook first."
             )
             return False
 
@@ -1569,17 +716,13 @@ class HeaderConsolidatorApp:
 
             messagebox.showwarning(
                 "Color Mapping Warning",
-                "The same color is assigned to different "
-                "header names.\n\n"
+                "The same color is assigned to different header names.\n\n"
                 f"{conflict_text}\n\n"
-                "This is only a warning.\n"
-                "You can still use FINAL CONSOLIDATE."
+                "This is only a warning. You can still use FINAL CONSOLIDATE."
             )
-
             self.status_var.set(
                 "Warning: same color used for different headers."
             )
-
             return True
 
         messagebox.showinfo(
@@ -1587,67 +730,48 @@ class HeaderConsolidatorApp:
             "Header color mapping is valid.\n\n"
             "No conflicting color mapping was found."
         )
-
-        self.status_var.set(
-            "Mapping validation successful."
-        )
-
+        self.status_var.set("Mapping validation successful.")
         return True
 
-    # ========================================================
-    # BUILD COLOR GROUPS
-    # ========================================================
-
+    # ------------------------------------------------------------
+    # Output mapping
+    # ------------------------------------------------------------
     def build_color_groups(self):
         color_groups = OrderedDict()
 
-        for sheet_name, headers in self.sheet_headers.items():
-            for header_info in headers:
-                color = header_info["color"]
-
+        for _, headers in self.sheet_headers.items():
+            for info in headers:
+                color = info["color"]
                 if color == "None":
                     continue
 
-                header = header_info["original_header"]
-
-                if color not in color_groups:
-                    color_groups[color] = []
+                header = info["original_header"]
+                color_groups.setdefault(color, [])
 
                 if header not in color_groups[color]:
                     color_groups[color].append(header)
 
         return color_groups
 
-    # ========================================================
-    # BUILD OUTPUT HEADERS
-    # ========================================================
-
     def build_output_headers(self, color_groups):
-        # Source Sheet is always first for reference.
-        output_headers = ["Source Sheet"]
+        output_headers = []
 
-        # Colored groups.
-        for color, headers in color_groups.items():
+        # First header found for a color becomes the output field.
+        for _, headers in color_groups.items():
             if headers:
-                if headers[0] not in output_headers:
-                    output_headers.append(headers[0])
+                output_headers.append(headers[0])
 
-        # Uncolored headers.
-        for sheet_name, headers in self.sheet_headers.items():
-            for header_info in headers:
-                if header_info["color"] != "None":
+        # Uncolored headers are retained as their original names.
+        for _, headers in self.sheet_headers.items():
+            for info in headers:
+                if info["color"] != "None":
                     continue
 
-                header = header_info["original_header"]
-
+                header = info["original_header"]
                 if header not in output_headers:
                     output_headers.append(header)
 
         return output_headers
-
-    # ========================================================
-    # GET OUTPUT HEADER FOR SOURCE HEADER
-    # ========================================================
 
     def get_output_header(self, header_info, color_groups):
         color = header_info["color"]
@@ -1658,26 +782,9 @@ class HeaderConsolidatorApp:
 
         return original_header
 
-    # ========================================================
-    # GET DATA TO CONSOLIDATE
-    # ========================================================
-
-    def get_sheet_rows_for_consolidation(self, sheet_name):
-        full_df = self.sheet_data[sheet_name]
-
-        if not self.use_filtered_rows:
-            return full_df
-
-        # If a sheet has not been filtered, keep all its rows.
-        if sheet_name not in self.filtered_rows_by_sheet:
-            return full_df
-
-        return self.filtered_rows_by_sheet[sheet_name]
-
-    # ========================================================
-    # FINAL CONSOLIDATION
-    # ========================================================
-
+    # ------------------------------------------------------------
+    # Final consolidation
+    # ------------------------------------------------------------
     def final_consolidate(self):
         if not self.file_path:
             messagebox.showwarning(
@@ -1688,8 +795,7 @@ class HeaderConsolidatorApp:
 
         if not self.sheet_headers:
             messagebox.showwarning(
-                "No Data",
-                "No worksheets were loaded."
+                "No Data", "No worksheets were loaded."
             )
             return
 
@@ -1704,188 +810,236 @@ class HeaderConsolidatorApp:
             answer = messagebox.askyesno(
                 "Color Mapping Warning",
                 "WARNING\n\n"
-                "The same color has been assigned to different "
-                "header names.\n\n"
+                "The same color has been assigned to different header names.\n\n"
                 f"{conflict_text}\n\n"
-                "The program will treat headers with the same "
-                "color as the same consolidated field.\n\n"
-                "Do you still want to continue with "
-                "FINAL CONSOLIDATE?"
+                "Headers with the same color will be treated as one "
+                "consolidated field.\n\n"
+                "Do you still want to continue with FINAL CONSOLIDATE?"
             )
-
             if not answer:
-                self.status_var.set(
-                    "Consolidation cancelled."
-                )
+                self.status_var.set("Consolidation cancelled.")
                 return
-
-        filter_message = (
-            "• Use the selected filtered rows\n"
-            if self.use_filtered_rows
-            else "• Use all source rows\n"
-        )
 
         answer = messagebox.askyesno(
             "Final Consolidation",
             "Ready to consolidate the workbook.\n\n"
             "The program will:\n\n"
-            "• Preserve every selected source row\n"
-            f"{filter_message}"
-            "• Add Source Sheet to every row\n"
+            "• Preserve every source row\n"
+            "• Append rows from all sheets\n"
+            "• Add Source Sheet for reference\n"
             "• Align columns using header/color mapping\n"
+            "• Automatically use the first header for each color group\n"
+            "• Split very large exports into multiple Excel sheets\n"
             "• NOT match people or records\n"
             "• NOT deduplicate rows\n"
             "• NOT merge rows\n\n"
             "Do you want to continue?"
         )
-
         if not answer:
             return
 
-        input_name = os.path.splitext(
-            os.path.basename(self.file_path)
-        )[0]
-
-        default_name = (
-            f"{input_name}_Consolidated.xlsx"
-        )
+        input_name = os.path.splitext(os.path.basename(self.file_path))[0]
+        default_name = f"{input_name}_Consolidated.xlsx"
 
         output_path = filedialog.asksaveasfilename(
             title="Save Consolidated Excel File",
             defaultextension=".xlsx",
             initialfile=default_name,
-            filetypes=[
-                ("Excel Workbook", "*.xlsx")
-            ]
+            filetypes=[("Excel Workbook", "*.xlsx")]
         )
-
         if not output_path:
             return
 
         self.output_path = output_path
 
         try:
-            self.status_var.set(
-                "Consolidating data..."
-            )
+            self.status_var.set("Consolidating data...")
             self.root.update_idletasks()
 
-            all_output_rows = []
-
+            excel = pd.ExcelFile(self.file_path)
             color_groups = self.build_color_groups()
-            output_headers = self.build_output_headers(
-                color_groups
-            )
+            output_headers = self.build_output_headers(color_groups)
 
+            # Source Sheet is always included as the first reference column.
+            final_headers = ["Source Sheet"] + output_headers
+
+            all_output_rows = []
             total_rows = 0
 
-            # Process every worksheet.
-            for sheet_name in self.sheet_headers.keys():
-                self.status_var.set(
-                    f"Processing sheet: {sheet_name}"
-                )
+            for sheet_name in excel.sheet_names:
+                self.status_var.set(f"Processing sheet: {sheet_name}")
                 self.root.update_idletasks()
 
-                df = self.get_sheet_rows_for_consolidation(
-                    sheet_name
+                df = pd.read_excel(
+                    self.file_path,
+                    sheet_name=sheet_name,
+                    dtype=object
                 )
 
-                if df is None or len(df.columns) == 0:
+                if len(df.columns) == 0:
                     continue
 
-                sheet_header_info = self.sheet_headers.get(
-                    sheet_name,
-                    []
-                )
+                sheet_header_info = self.sheet_headers.get(sheet_name, [])
 
                 column_output_map = {}
-
                 for info in sheet_header_info:
-                    column_index = info["column_index"]
-
-                    if column_index >= len(df.columns):
+                    idx = info["column_index"]
+                    if idx >= len(df.columns):
                         continue
 
                     output_header = self.get_output_header(
-                        info,
-                        color_groups
+                        info, color_groups
                     )
+                    column_output_map[idx] = output_header
 
-                    column_output_map[
-                        column_index
-                    ] = output_header
-
-                # Every source row remains a separate output row.
                 for _, source_row in df.iterrows():
-                    output_row = {
-                        header: ""
-                        for header in output_headers
-                    }
-
-                    # Source Sheet reference.
+                    output_row = {header: "" for header in final_headers}
                     output_row["Source Sheet"] = sheet_name
-
                     has_data = False
 
-                    for (
-                        column_index,
-                        output_header
-                    ) in column_output_map.items():
-
+                    for column_index, output_header in column_output_map.items():
                         if column_index >= len(source_row):
                             continue
 
                         value = source_row.iloc[column_index]
+                        if pd.isna(value):
+                            continue
 
-                        if pd.notna(value):
+                        # If two source columns map to the same output header
+                        # within one row, preserve both values instead of
+                        # silently overwriting one.
+                        existing = output_row.get(output_header, "")
+                        if existing not in ("", None) and str(existing) != str(value):
+                            output_row[output_header] = (
+                                f"{existing} | {value}"
+                            )
+                        else:
                             output_row[output_header] = value
-                            has_data = True
 
-                    # Keep the row if it contains data.
+                        has_data = True
+
                     if has_data:
-                        all_output_rows.append(
-                            output_row
-                        )
+                        all_output_rows.append(output_row)
                         total_rows += 1
 
             result_df = pd.DataFrame(
                 all_output_rows,
-                columns=output_headers
+                columns=final_headers
             )
 
-            # Save output.
-            result_df.to_excel(
-                output_path,
-                index=False,
-                sheet_name="Consolidated"
+            # ------------------------------------------------------------
+            # LARGE DATA EXPORT
+            # ------------------------------------------------------------
+            # Excel supports a maximum of 1,048,576 rows per worksheet.
+            # The first row is the header, so data is automatically divided
+            # into safe-sized worksheet parts.
+            MAX_DATA_ROWS_PER_SHEET = 1_048_575
+
+            total_export_parts = max(
+                1,
+                (len(result_df) + MAX_DATA_ROWS_PER_SHEET - 1)
+                // MAX_DATA_ROWS_PER_SHEET
             )
 
             self.status_var.set(
-                f"Completed: {total_rows:,} rows consolidated."
+                f"Preparing export: {len(result_df):,} rows "
+                f"across {total_export_parts} Excel sheet(s)..."
+            )
+            self.root.update_idletasks()
+
+            # Export in parts so large data never exceeds Excel's worksheet
+            # row limit. No rows are discarded.
+            with pd.ExcelWriter(
+                output_path, engine="openpyxl"
+            ) as writer:
+
+                if result_df.empty:
+                    result_df.to_excel(
+                        writer,
+                        index=False,
+                        sheet_name="Consolidated_Part_1"
+                    )
+                    parts_created = 1
+
+                else:
+                    parts_created = 0
+
+                    for start_row in range(
+                        0, len(result_df), MAX_DATA_ROWS_PER_SHEET
+                    ):
+                        end_row = min(
+                            start_row + MAX_DATA_ROWS_PER_SHEET,
+                            len(result_df)
+                        )
+
+                        part_number = parts_created + 1
+                        sheet_name = f"Consolidated_Part_{part_number}"
+
+                        self.status_var.set(
+                            f"Exporting Part {part_number} of "
+                            f"{total_export_parts}: rows "
+                            f"{start_row + 1:,} - {end_row:,}"
+                        )
+                        self.root.update_idletasks()
+
+                        part_df = result_df.iloc[start_row:end_row]
+
+                        part_df.to_excel(
+                            writer,
+                            index=False,
+                            sheet_name=sheet_name
+                        )
+
+                        ws = writer.book[sheet_name]
+                        ws.freeze_panes = "A2"
+                        ws.auto_filter.ref = ws.dimensions
+
+                        # Reasonable column widths without allowing very long
+                        # cell values to make the workbook unnecessarily wide.
+                        for column_cells in ws.columns:
+                            max_length = 0
+                            column_letter = column_cells[0].column_letter
+
+                            for cell in column_cells:
+                                try:
+                                    value_length = len(str(cell.value))
+                                    max_length = max(
+                                        max_length,
+                                        min(value_length, 45)
+                                    )
+                                except Exception:
+                                    pass
+
+                            ws.column_dimensions[column_letter].width = min(
+                                max(max_length + 2, 12), 45
+                            )
+
+                        parts_created += 1
+
+            self.status_var.set(
+                f"Completed: {total_rows:,} rows exported into "
+                f"{parts_created} Excel sheet(s)."
             )
 
             messagebox.showinfo(
                 "Consolidation Complete",
-                "Consolidation completed successfully.\n\n"
-                f"Sheets processed: "
-                f"{len(self.sheet_headers)}\n"
-                f"Output columns: "
-                f"{len(output_headers)}\n"
-                f"Output rows: "
-                f"{total_rows:,}\n\n"
-                f"Source Sheet column included.\n\n"
-                f"Saved to:\n"
-                f"{output_path}"
+                "Consolidation and export completed successfully.\n\n"
+                f"Sheets processed: {len(excel.sheet_names)}\n"
+                f"Output columns: {len(final_headers)}\n"
+                f"Output rows: {total_rows:,}\n"
+                f"Excel output parts: {parts_created}\n\n"
+                "Large data was automatically divided into multiple "
+                "Excel sheets to stay within Excel's row limit.\n\n"
+                "Every exported row is preserved.\n"
+                "Source Sheet column is included for reference.\n\n"
+                f"Saved to:\n{output_path}"
             )
 
-            open_folder = messagebox.askyesno(
+            if messagebox.askyesno(
                 "Open Output Folder",
                 "Do you want to open the output folder?"
-            )
-
-            if open_folder:
+            ):
                 folder = os.path.dirname(output_path)
-
                 try:
                     os.startfile(folder)
                 except Exception:
@@ -1895,29 +1049,18 @@ class HeaderConsolidatorApp:
             messagebox.showerror(
                 "Permission Error",
                 "Unable to save the output file.\n\n"
-                "Please make sure the output Excel file is not "
-                "already open."
+                "Please make sure the output Excel file is not already open."
             )
-
-            self.status_var.set(
-                "Unable to save output file."
-            )
+            self.status_var.set("Unable to save output file.")
 
         except Exception as e:
             messagebox.showerror(
                 "Consolidation Error",
-                "An error occurred during consolidation.\n\n"
+                f"An error occurred during consolidation.\n\n"
                 f"{type(e).__name__}: {e}"
             )
+            self.status_var.set("Consolidation failed.")
 
-            self.status_var.set(
-                "Consolidation failed."
-            )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
     root = tk.Tk()
